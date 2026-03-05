@@ -35,6 +35,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [hasApiKey, setHasApiKey] = useState(false);
   const [generationStatus, setGenerationStatus] = useState<string>('');
+  const [refImageIndex, setRefImageIndex] = useState(0);
 
   const fileInputRefs = [
     useRef<HTMLInputElement>(null),
@@ -157,14 +158,18 @@ ${trendingTitles.length > 0 ? trendingTitles.map((t, i) => `${i + 1}. ${t}`).joi
 Study the tone, hooks, phrasing style, and energy from these titles. Use them as inspiration — do NOT copy them directly.
 
 Step 3 — Script Generation:
-Write a punchy 15-second Korean marketing hook script for the store named "${storeName}".
+Write a punchy 15-second Korean YouTube Shorts hook script for the store named "${storeName}".
+- This is a VIDEO SCRIPT for YouTube Shorts, NOT a social media caption.
+- Format: short punchy sentences spoken aloud, like a voiceover or on-screen text sequence.
 - Naturally include the store name "${storeName}" in the script.
 - Do NOT mention the business type or industry anywhere in the script.
-- Use trendy, catchy language inspired by the trending titles above.
-- The script should be formatted in Markdown.
+- Do NOT use hashtags (#).
+- Do NOT use emojis.
+- Use trendy, catchy spoken language inspired by the trending titles above.
+- The script should be formatted in Markdown as a sequence of short lines (1~2 sentences each).
 
 Step 3 — Video Prompt:
-Write a detailed English visual prompt for a video generation model (Veo) that captures the essence of the images and matches the script's energy.
+Write a detailed English visual prompt for Veo describing the colors, textures, subjects, atmosphere, and key visual elements found across all 4 images. The prompt should guide Veo to create a cohesive 15-second marketing video that reflects the visual identity of these images. Match the script's energy and tone.
 
 Return ONLY a JSON object with keys: "script" and "videoPrompt".`
               }
@@ -193,16 +198,35 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
       canvas.width = size * 2;
       canvas.height = size * 2;
       const ctx = canvas.getContext('2d')!;
-      let loaded = 0;
+      const labels = ['A1', 'A2', 'A3', 'A4'];
       const positions = [
         [0, 0], [size, 0],
         [0, size], [size, size],
       ];
+      let loaded = 0;
       imgs.forEach((src, i) => {
         const img = new Image();
         img.onload = () => {
           const [x, y] = positions[i];
           ctx.drawImage(img, x, y, size, size);
+
+          // 라벨 배지
+          const pad = 16;
+          const fontSize = 48;
+          ctx.font = `bold ${fontSize}px sans-serif`;
+          const text = labels[i];
+          const tw = ctx.measureText(text).width;
+          const bw = tw + pad * 2;
+          const bh = fontSize + pad;
+
+          ctx.fillStyle = 'rgba(0,0,0,0.65)';
+          ctx.beginPath();
+          ctx.roundRect(x + 20, y + 20, bw, bh, 10);
+          ctx.fill();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(text, x + 20 + pad, y + 20 + fontSize - 4);
+
           loaded++;
           if (loaded === imgs.length) {
             resolve(canvas.toDataURL('image/png').split(',')[1]);
@@ -227,51 +251,79 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       const validImages = images.filter(img => img !== null) as string[];
 
-      setGenerationStatus('이미지 4장 합성 중...');
-      const gridImageBytes = await mergeImagesGrid(validImages);
-
       setGenerationStatus('Generating cinematic 15-second short...');
 
       let operation = await ai.models.generateVideos({
         model: 'veo-3.1-fast-generate-preview',
-        prompt: marketingData.videoPrompt + " The video should be a high-quality 15-second marketing short, cinematic lighting, professional editing style. Reference all visual elements from the provided composite image.",
+        prompt: marketingData.videoPrompt + ` High-quality 15-second marketing short, cinematic lighting, professional editing style. NO speech, NO narration, NO voiceover, NO TTS. Add only ambient sound effects and background music that naturally fit the scene atmosphere and mood.`,
         image: {
-          imageBytes: gridImageBytes,
+          imageBytes: validImages[refImageIndex % validImages.length].split(',')[1],
           mimeType: 'image/png',
         },
         config: {
           numberOfVideos: 1,
-          aspectRatio: '9:16'
+          aspectRatio: '9:16',
         }
       });
 
+      const MAX_POLLS = 36; // 최대 6분 대기
       let pollCount = 0;
+
       while (!operation.done) {
+        if (pollCount >= MAX_POLLS) {
+          throw new Error("영상 생성 시간이 초과되었습니다. 다시 시도해주세요.");
+        }
         pollCount++;
-        setGenerationStatus(`Crafting frames... (${pollCount * 10}s elapsed)`);
+        setGenerationStatus(`영상 생성 중... (${pollCount * 10}초 경과)`);
         await new Promise(resolve => setTimeout(resolve, 10000));
         try {
           operation = await ai.operations.getVideosOperation({ operation: operation });
         } catch (e: any) {
           if (e.message.includes("Requested entity was not found")) {
             setHasApiKey(false);
-            throw new Error("API Key session expired. Please select your API key again.");
+            throw new Error("API Key 세션이 만료되었습니다. 다시 시도해주세요.");
           }
           throw e;
         }
+
+        // 작업 실패 감지
+        if ((operation as any).error) {
+          throw new Error("영상 생성 실패: " + JSON.stringify((operation as any).error));
+        }
       }
 
-      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
-      if (downloadLink) {
-        const videoResponse = await fetch(downloadLink, {
+      console.log('Operation response:', JSON.stringify(operation, null, 2));
+
+      const generatedVideo = operation.response?.generatedVideos?.[0]?.video;
+
+      if (!generatedVideo) {
+        const filteredCount = operation.response?.raiMediaFilteredCount;
+        throw new Error(`영상 생성 실패. RAI 차단 ${filteredCount}개 | 응답: ${JSON.stringify(operation.response)}`);
+      }
+
+      // videoBytes로 반환된 경우
+      if (generatedVideo.videoBytes) {
+        const byteArray = Uint8Array.from(atob(generatedVideo.videoBytes), c => c.charCodeAt(0));
+        const blob = new Blob([byteArray], { type: generatedVideo.mimeType || 'video/mp4' });
+        setVideoUrl(URL.createObjectURL(blob));
+        setRefImageIndex(prev => (prev + 1) % validImages.length);
+        return;
+      }
+
+      // uri로 반환된 경우
+      if (generatedVideo.uri) {
+        const videoResponse = await fetch(generatedVideo.uri, {
           method: 'GET',
-          headers: {
-            'x-goog-api-key': process.env.GEMINI_API_KEY!,
-          },
+          headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY! },
         });
+        if (!videoResponse.ok) throw new Error(`영상 다운로드 실패: ${videoResponse.status}`);
         const blob = await videoResponse.blob();
         setVideoUrl(URL.createObjectURL(blob));
+        setRefImageIndex(prev => (prev + 1) % validImages.length);
+        return;
       }
+
+      throw new Error(`영상 데이터 없음: ${JSON.stringify(generatedVideo)}`);
     } catch (err: any) {
       setError("Failed to generate video: " + err.message);
     } finally {
