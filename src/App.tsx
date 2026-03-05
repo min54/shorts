@@ -36,6 +36,7 @@ export default function App() {
   const [hasApiKey, setHasApiKey] = useState(false);
   const [generationStatus, setGenerationStatus] = useState<string>('');
   const [refImageIndex, setRefImageIndex] = useState(0);
+  const [isGeneratingSlideshow, setIsGeneratingSlideshow] = useState(false);
 
   const fileInputRefs = [
     useRef<HTMLInputElement>(null),
@@ -78,6 +79,8 @@ export default function App() {
     setVideoUrl(null);
     setError(null);
     setGenerationStatus('');
+    setRefImageIndex(0);
+    setIsGeneratingSlideshow(false);
     fileInputRefs.forEach(ref => {
       if (ref.current) ref.current.value = '';
     });
@@ -181,10 +184,24 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
         }
       });
 
-      const data = JSON.parse(response.text || '{}') as MarketingData;
+      if (!response.text) {
+        throw new Error("Gemini 응답이 비어있습니다. 다시 시도해주세요.");
+      }
+
+      let data: MarketingData;
+      try {
+        data = JSON.parse(response.text) as MarketingData;
+      } catch {
+        throw new Error(`JSON 파싱 실패. 응답: ${response.text.slice(0, 200)}`);
+      }
+
+      if (!data.script || !data.videoPrompt) {
+        throw new Error(`스크립트 또는 영상 프롬프트가 없습니다. 응답: ${JSON.stringify(data)}`);
+      }
+
       setMarketingData(data);
     } catch (err: any) {
-      setError("Failed to generate script: " + err.message);
+      setError("스크립트 생성 실패: " + err.message);
     } finally {
       setIsGeneratingScript(false);
       setGenerationStatus('');
@@ -237,6 +254,112 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
     });
   };
 
+  const generateSlideshow = async () => {
+    const validImages = images.filter(img => img !== null) as string[];
+    setIsGeneratingSlideshow(true);
+    setError(null);
+    setGenerationStatus('원본 이미지 로딩 중...');
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1080;
+      canvas.height = 1920;
+      const ctx = canvas.getContext('2d')!;
+
+      const loadedImgs = await Promise.all(validImages.map(src =>
+        new Promise<HTMLImageElement>(resolve => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.src = src;
+        })
+      ));
+
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9' : 'video/webm';
+
+      const stream = canvas.captureStream(30);
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const chunks: Blob[] = [];
+
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+      const recordingDone = new Promise<void>(resolve => {
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: mimeType });
+          setVideoUrl(URL.createObjectURL(blob));
+          resolve();
+        };
+      });
+
+      recorder.start(100);
+
+      const SEC_PER_IMAGE = 15 / validImages.length;
+      const TRANSITION_SEC = 0.5;
+
+      const effects = [
+        { sx: 1.0, ex: 1.12, spx: 0,   epx: 0,   spy: 0,   epy: 0   },
+        { sx: 1.12, ex: 1.0, spx: -40, epx: 40,  spy: 0,   epy: 0   },
+        { sx: 1.0, ex: 1.12, spx: 30,  epx: -30, spy: 30,  epy: -30 },
+        { sx: 1.12, ex: 1.0, spx: 0,   epx: 0,   spy: -30, epy: 30  },
+      ];
+
+      const drawImg = (img: HTMLImageElement, scale: number, ox: number, oy: number, alpha: number) => {
+        const ia = img.width / img.height;
+        const ca = canvas.width / canvas.height;
+        let dw = ia > ca ? canvas.height * scale * ia : canvas.width * scale;
+        let dh = ia > ca ? canvas.height * scale : canvas.width * scale / ia;
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(img, (canvas.width - dw) / 2 + ox, (canvas.height - dh) / 2 + oy, dw, dh);
+        ctx.globalAlpha = 1;
+      };
+
+      for (let i = 0; i < loadedImgs.length; i++) {
+        setGenerationStatus(`슬라이드쇼 생성 중... (${i + 1}/${loadedImgs.length})`);
+        const img = loadedImgs[i];
+        const nextImg = loadedImgs[(i + 1) % loadedImgs.length];
+        const ef = effects[i % effects.length];
+        const nef = effects[(i + 1) % effects.length];
+        const startTime = performance.now();
+
+        await new Promise<void>(resolve => {
+          const frame = () => {
+            const elapsed = (performance.now() - startTime) / 1000;
+            const progress = Math.min(elapsed / SEC_PER_IMAGE, 1);
+            const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+
+            const scale = ef.sx + (ef.ex - ef.sx) * eased;
+            const ox = ef.spx + (ef.epx - ef.spx) * eased;
+            const oy = ef.spy + (ef.epy - ef.spy) * eased;
+
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const timeLeft = SEC_PER_IMAGE - elapsed;
+            if (timeLeft < TRANSITION_SEC && i < loadedImgs.length - 1) {
+              const fade = 1 - timeLeft / TRANSITION_SEC;
+              drawImg(img, scale, ox, oy, 1 - fade);
+              drawImg(nextImg, nef.sx, nef.spx, nef.spy, fade);
+            } else {
+              drawImg(img, scale, ox, oy, 1);
+            }
+
+            if (progress < 1) requestAnimationFrame(frame);
+            else resolve();
+          };
+          requestAnimationFrame(frame);
+        });
+      }
+
+      recorder.stop();
+      await recordingDone;
+    } catch (err: any) {
+      setError('슬라이드쇼 생성 실패: ' + err.message);
+    } finally {
+      setIsGeneratingSlideshow(false);
+      setGenerationStatus('');
+    }
+  };
+
   const generateVideo = async () => {
     if (!marketingData) return;
     if (!hasApiKey) {
@@ -255,7 +378,7 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
 
       let operation = await ai.models.generateVideos({
         model: 'veo-3.1-fast-generate-preview',
-        prompt: marketingData.videoPrompt + ` High-quality 15-second marketing short, cinematic lighting, professional editing style. NO speech, NO narration, NO voiceover, NO TTS. Add only ambient sound effects and background music that naturally fit the scene atmosphere and mood.`,
+        prompt: marketingData.videoPrompt + ` Shot on iPhone 15 Pro, ultra-realistic handheld footage, natural lighting, slight camera movement and subtle shake for authenticity, shallow depth of field, true-to-life colors, photorealistic textures, real-world environment. Style: candid documentary feel mixed with modern lifestyle content. 15-second vertical marketing short. NO speech, NO narration, NO voiceover, NO TTS. Add only ambient sound effects and background music that naturally fit the scene atmosphere and mood.`,
         image: {
           imageBytes: validImages[refImageIndex % validImages.length].split(',')[1],
           mimeType: 'image/png',
@@ -514,26 +637,36 @@ Return ONLY a JSON object with keys: "script" and "videoPrompt".`
                     <ReactMarkdown>{marketingData.script}</ReactMarkdown>
                   </div>
 
-                  <button
-                    disabled={isGeneratingVideo}
-                    onClick={generateVideo}
-                    className={cn(
-                      "w-full py-4 rounded-2xl font-semibold text-lg transition-all flex items-center justify-center gap-3 shadow-xl",
-                      "bg-white text-black hover:bg-zinc-200 shadow-white/10"
-                    )}
-                  >
-                    {isGeneratingVideo ? (
-                      <>
-                        <Loader2 className="w-6 h-6 animate-spin" />
-                        Generating Video...
-                      </>
-                    ) : (
-                      <>
-                        <Video className="w-6 h-6" />
-                        Create 15s Marketing Short
-                      </>
-                    )}
-                  </button>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      disabled={isGeneratingVideo || isGeneratingSlideshow}
+                      onClick={generateVideo}
+                      className={cn(
+                        "w-full py-4 rounded-2xl font-semibold text-base transition-all flex items-center justify-center gap-2 shadow-xl",
+                        "bg-white text-black hover:bg-zinc-200 shadow-white/10"
+                      )}
+                    >
+                      {isGeneratingVideo ? (
+                        <><Loader2 className="w-5 h-5 animate-spin" />AI 생성 중...</>
+                      ) : (
+                        <><Sparkles className="w-5 h-5" />AI 영상</>
+                      )}
+                    </button>
+                    <button
+                      disabled={isGeneratingVideo || isGeneratingSlideshow}
+                      onClick={generateSlideshow}
+                      className={cn(
+                        "w-full py-4 rounded-2xl font-semibold text-base transition-all flex items-center justify-center gap-2 shadow-xl",
+                        "bg-emerald-500 text-black hover:bg-emerald-400 shadow-emerald-500/20"
+                      )}
+                    >
+                      {isGeneratingSlideshow ? (
+                        <><Loader2 className="w-5 h-5 animate-spin" />생성 중...</>
+                      ) : (
+                        <><ImageIcon className="w-5 h-5" />원본 슬라이드</>
+                      )}
+                    </button>
+                  </div>
                 </motion.section>
               )}
             </AnimatePresence>
