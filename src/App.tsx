@@ -696,11 +696,9 @@ Return ONLY a JSON object with keys: "script", "videoPrompt", and "overlays" (ar
               ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
               const sm = ctx.measureText(overlay);
-              const spx = subFs * 0.65, spy = subFs * 0.38;
-              ctx.fillStyle = 'rgba(0,0,0,0.62)';
-              ctx.beginPath();
-              ctx.roundRect(canvas.width / 2 - sm.width / 2 - spx, subY - subFs / 2 - spy, sm.width + spx * 2, subFs + spy * 2, 10);
-              ctx.fill();
+              const spx = 24, spy = 16;
+              ctx.fillStyle = 'rgba(204, 51, 255, 0.8)';
+              ctx.fillRect(canvas.width / 2 - sm.width / 2 - spx, subY - subFs / 2 - spy, sm.width + spx * 2, subFs + spy * 2);
               ctx.shadowColor = 'rgba(0,0,0,0.9)';
               ctx.shadowBlur = 10;
               ctx.fillStyle = '#ffffff';
