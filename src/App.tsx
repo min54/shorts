@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { GoogleGenAI, Modality, GenerateContentResponse, VideoGenerationReferenceType, VideoGenerationReferenceImage } from "@google/genai";
 import { motion, AnimatePresence } from "motion/react";
 import { Upload, Sparkles, Video, Play, Loader2, CheckCircle2, AlertCircle, X, Image as ImageIcon, RotateCcw, Download } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -82,7 +81,9 @@ export default function App() {
 
   const checkApiKey = async () => {
     try {
-      if (process.env.GEMINI_API_KEY) {
+      // Netlify Functions 프록시 모드: 서버에 키가 있으면 OK
+      const res = await fetch('/.netlify/functions/gemini-content', { method: 'OPTIONS' });
+      if (res.ok) {
         setHasApiKey(true);
         return;
       }
@@ -91,7 +92,8 @@ export default function App() {
         setHasApiKey(selected);
       }
     } catch (e) {
-      console.error("Error checking API key:", e);
+      // 로컬 개발 시 직접 접근 불가하면 true로 설정
+      setHasApiKey(true);
     }
   };
 
@@ -146,9 +148,11 @@ export default function App() {
 
   const fetchTrendingShorts = async (type: string): Promise<string[]> => {
     try {
-      const res = await fetch(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoDuration=short&regionCode=KR&order=viewCount&maxResults=10&q=${encodeURIComponent(type + ' 숏츠')}&key=${process.env.YOUTUBE_API_KEY}`
-      );
+      const res = await fetch('/.netlify/functions/youtube-search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: type + ' 숏츠' }),
+      });
       const data = await res.json();
       return (data.items || []).map((item: any) => item.snippet.title as string);
     } catch {
@@ -170,8 +174,6 @@ export default function App() {
     setGenerationStatus('이미지 분석 및 스크립트 생성 중...');
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-
       const imageParts = validImages.map(img => ({
         inlineData: {
           data: img.split(',')[1],
@@ -179,14 +181,17 @@ export default function App() {
         }
       }));
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: [
-          {
-            parts: [
-              ...imageParts,
-              {
-                text: `You are a Korean marketing copywriting expert.
+      const res = await fetch('/.netlify/functions/gemini-content', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: "gemini-3.1-pro-preview",
+          contents: [
+            {
+              parts: [
+                ...imageParts,
+                {
+                  text: `You are a Korean marketing copywriting expert.
 
 Step 1 — Industry Recognition (internal only, do NOT include in output):
 Analyze the 4 images and identify the exact business type and industry. Use this understanding to determine what marketing styles, tones, and phrases are currently trending and popular for that specific industry in Korea. This step is for your internal reasoning only.
@@ -219,15 +224,17 @@ Rules:
 - Match the energy of the script
 
 Return ONLY a JSON object with keys: "script", "videoPrompt", and "overlays" (array of exactly ${validImages.length} strings).`
-              }
-            ]
+                }
+              ]
+            }
+          ],
+          config: {
+            responseMimeType: "application/json"
           }
-        ],
-        config: {
-          responseMimeType: "application/json"
-        }
+        }),
       });
 
+      const response = await res.json();
       if (!response.text) {
         throw new Error("Gemini 응답이 비어있습니다. 다시 시도해주세요.");
       }
@@ -725,7 +732,6 @@ Return ONLY a JSON object with keys: "script", "videoPrompt", and "overlays" (ar
 
   // Step 1: Gemini가 스크립트 + 4장 이미지 분석 → 씬별 8초 프롬프트 4개 생성
   const generateScenePrompts = async (script: string, basePrompt: string, imgs: string[]): Promise<string[]> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
     const imageParts = imgs.map(img => ({
       inlineData: {
         data: img.split(',')[1],
@@ -733,13 +739,16 @@ Return ONLY a JSON object with keys: "script", "videoPrompt", and "overlays" (ar
       }
     }));
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-pro-preview',
-      contents: [{
-        parts: [
-          ...imageParts,
-          {
-            text: `You are a video director creating a ${imgs.length * 8}-second marketing short film composed of ${imgs.length} scenes, each exactly 8 seconds long.
+    const res = await fetch('/.netlify/functions/gemini-content', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gemini-3.1-pro-preview',
+        contents: [{
+          parts: [
+            ...imageParts,
+            {
+              text: `You are a video director creating a ${imgs.length * 8}-second marketing short film composed of ${imgs.length} scenes, each exactly 8 seconds long.
 
 Marketing Script:
 ${script}
@@ -765,12 +774,14 @@ Each prompt must:
 - Be designed for exactly 8 seconds of footage
 
 Return ONLY a JSON array with exactly ${imgs.length} strings.`
-          }
-        ]
-      }],
-      config: { responseMimeType: 'application/json' }
+            }
+          ]
+        }],
+        config: { responseMimeType: 'application/json' }
+      }),
     });
 
+    const response = await res.json();
     const parsed = JSON.parse(response.text!) as string[];
     while (parsed.length < imgs.length) parsed.push(basePrompt);
     return parsed.slice(0, imgs.length);
@@ -778,21 +789,18 @@ Return ONLY a JSON array with exactly ${imgs.length} strings.`
 
   // Step 2: 이미지 1장 + 씬 프롬프트 → Veo 8초 클립 1개 생성
   const generateVeoClip = async (prompt: string, imageBase64: string, clipIndex: number): Promise<Blob> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
     const fullPrompt = prompt + ' Shot on iPhone 15 Pro, ultra-realistic handheld footage, natural lighting, shallow depth of field, photorealistic. 9:16 vertical format. NO speech, NO narration, NO voiceover. Ambient sound and background music only.';
 
-    let operation = await ai.models.generateVideos({
-      model: 'veo-3.1-fast-generate-preview',
-      prompt: fullPrompt,
-      image: {
+    const startRes = await fetch('/.netlify/functions/veo-generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: fullPrompt,
         imageBytes: imageBase64.split(',')[1],
         mimeType: 'image/png',
-      },
-      config: {
-        numberOfVideos: 1,
-        aspectRatio: '9:16',
-      }
+      }),
     });
+    let { operation } = await startRes.json();
 
     const MAX_POLLS = 36;
     let pollCount = 0;
@@ -803,12 +811,19 @@ Return ONLY a JSON array with exactly ${imgs.length} strings.`
       setGenerationStatus(`씬 ${clipIndex + 1} 생성 중... (${pollCount * 10}초 경과)`);
       await new Promise(resolve => setTimeout(resolve, 10000));
       try {
-        operation = await ai.operations.getVideosOperation({ operation });
-      } catch (e: any) {
-        if (e.message.includes("Requested entity was not found")) {
+        const pollRes = await fetch('/.netlify/functions/veo-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ operation }),
+        });
+        if (pollRes.status === 404) {
           setHasApiKey(false);
           throw new Error("API Key 세션이 만료되었습니다.");
         }
+        const pollData = await pollRes.json();
+        operation = pollData.operation;
+      } catch (e: any) {
+        if (e.message.includes("세션이 만료")) throw e;
         throw e;
       }
       if ((operation as any).error) throw new Error(`씬 ${clipIndex + 1} 실패: ${JSON.stringify((operation as any).error)}`);
@@ -823,9 +838,15 @@ Return ONLY a JSON array with exactly ${imgs.length} strings.`
     }
 
     if (generatedVideo.uri) {
-      const res = await fetch(generatedVideo.uri, { headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY! } });
-      if (!res.ok) throw new Error(`씬 ${clipIndex + 1} 다운로드 실패: ${res.status}`);
-      return res.blob();
+      const dlRes = await fetch('/.netlify/functions/veo-download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uri: generatedVideo.uri }),
+      });
+      const dlData = await dlRes.json();
+      if (!dlRes.ok) throw new Error(`씬 ${clipIndex + 1} 다운로드 실패: ${dlRes.status}`);
+      const byteArray = Uint8Array.from(atob(dlData.videoBase64), c => c.charCodeAt(0));
+      return new Blob([byteArray], { type: dlData.mimeType || 'video/mp4' });
     }
 
     throw new Error(`씬 ${clipIndex + 1} 데이터 없음`);
